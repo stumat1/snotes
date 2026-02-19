@@ -102,7 +102,7 @@ class NoteApp:
         self.note_listbox.bind('<<ListboxSelect>>', self.on_note_select)
 
         # Now that listbox exists, we can set up the search trace
-        self.search_var.trace('w', lambda *args: self.filter_notes())
+        self.search_var.trace_add('write', lambda *args: self.filter_notes())
 
         # Right side - editor
         editor_container = ttk.Frame(main_container)
