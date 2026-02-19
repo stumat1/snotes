@@ -304,6 +304,11 @@ class NoteApp:
             self.text_editor.edit_modified(False)
             return
 
+        # Note may no longer exist (e.g. was just removed by delete_note)
+        if self.current_note_id not in self.notes:
+            self.text_editor.edit_modified(False)
+            return
+
         lines = content.split('\n')
         title = lines[0][:50] if lines[0] else 'Untitled'
         if not title.strip():
