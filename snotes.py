@@ -79,6 +79,7 @@ class NoteApp:
         self.search_entry.insert(0, "Search...")
         self.search_entry.bind('<FocusIn>', lambda e: self.on_search_focus_in(e))
         self.search_entry.bind('<FocusOut>', lambda e: self.on_search_focus_out(e))
+        self.search_entry.bind('<Escape>', self._clear_search)
 
         # Note list
         list_frame = ttk.Frame(sidebar)
@@ -148,7 +149,9 @@ class NoteApp:
         self.text_editor.bind('<<Modified>>', self.on_text_modified)
         self.text_editor.bind('<KeyRelease>', lambda e: self._update_status())
 
-        # Keyboard shortcuts
+        # Keyboard shortcuts — bind Ctrl+N on the editor directly so "break"
+        # prevents the Text widget's class binding from inserting a newline first
+        self.text_editor.bind('<Control-n>', lambda e: self.new_note() or "break")
         self.root.bind('<Control-n>', lambda e: self.new_note())
         self.root.bind('<Control-s>', lambda e: self.save_current_note())
 
@@ -158,6 +161,11 @@ class NoteApp:
 
         # Populate note list
         self.update_note_list()
+
+    def _clear_search(self, event=None):
+        self.search_var.set("")
+        self.text_editor.focus_set()
+        return "break"
 
     def on_search_focus_in(self, event):
         if self.search_var.get() == "Search...":
@@ -236,7 +244,11 @@ class NoteApp:
             self.save_config()
 
             self.update_note_list()
-            self._update_status()
+            modified = note_data.get('modified', '')
+            if modified:
+                self.status_bar.config(text=f"Last modified: {self._time_ago(modified)}")
+            else:
+                self._update_status()
 
     def new_note(self):
         self.save_current_note()
@@ -291,6 +303,24 @@ class NoteApp:
 
     def _update_status(self):
         self.status_bar.config(text=self._word_count_text())
+
+    def _time_ago(self, iso_string):
+        try:
+            dt = datetime.fromisoformat(iso_string)
+            seconds = int((datetime.now() - dt).total_seconds())
+            if seconds < 60:
+                return "just now"
+            elif seconds < 3600:
+                m = seconds // 60
+                return f"{m} minute{'s' if m != 1 else ''} ago"
+            elif seconds < 86400:
+                h = seconds // 3600
+                return f"{h} hour{'s' if h != 1 else ''} ago"
+            else:
+                d = seconds // 86400
+                return f"{d} day{'s' if d != 1 else ''} ago"
+        except Exception:
+            return ""
 
     def save_current_note(self):
         if not self.current_note_id:
