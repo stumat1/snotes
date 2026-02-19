@@ -5,7 +5,7 @@ A lightweight, thoughtful note-taking application with auto-save and search.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, font
+from tkinter import ttk, messagebox, font, filedialog
 import json
 import os
 from datetime import datetime
@@ -117,6 +117,9 @@ class NoteApp:
 
         delete_btn = ttk.Button(toolbar, text="Delete", command=self.delete_note)
         delete_btn.pack(side=tk.RIGHT, padx=(5, 0))
+
+        save_txt_btn = ttk.Button(toolbar, text="Save TXT", command=self.export_as_txt)
+        save_txt_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
         # Text editor
         editor_frame = ttk.Frame(editor_container)
@@ -324,6 +327,36 @@ class NoteApp:
         self.save_notes()
         self.update_note_list()
         self.text_editor.edit_modified(False)
+
+    def export_as_txt(self):
+        if not self.current_note_id:
+            return
+
+        content = self.text_editor.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showinfo("Export", "Nothing to save — the note is empty.")
+            return
+
+        title = self.notes.get(self.current_note_id, {}).get('title', 'note')
+        default_name = title[:50].strip() + ".txt"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=default_name,
+            title="Save note as TXT"
+        )
+
+        if not file_path:
+            return  # User cancelled
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.status_bar.config(text=f"Saved: {Path(file_path).name}")
+            self.root.after(3000, self._update_status)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {e}")
 
     def load_notes(self):
         if self.notes_file.exists():
