@@ -11,11 +11,29 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Color palette
+# ---------------------------------------------------------------------------
+C = {
+    'bg':       '#fafaf8',   # main background (warm white)
+    'sidebar':  '#f0efed',   # sidebar (slightly darker)
+    'surface':  '#e8e7e4',   # inputs, surface cards
+    'surface2': '#d4d3d0',   # hover states, dividers
+    'text':     '#37352f',   # primary text (warm near-black)
+    'subtext':  '#787672',   # secondary text
+    'muted':    '#9b9a97',   # placeholder / disabled
+    'accent':   '#5b8dd9',   # primary accent (blue)
+    'accent_h': '#4070b8',   # accent hover
+    'red':      '#c7382a',   # danger (delete button text)
+    'select':   '#d3e3f3',   # text selection background
+}
+
 
 class NoteApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Notes")
+        self.root.configure(bg=C['bg'])
 
         # Set up data directory
         self.data_dir = Path.home() / ".simple_notes"
@@ -30,6 +48,7 @@ class NoteApp:
         self.current_note_id = self.config.get("last_note_id")
         self.auto_save_after_id = None
         self.displayed_note_ids = []  # Parallel list tracking note IDs shown in listbox
+        self._hovered_idx = None
 
         # Create UI
         self.create_ui()
@@ -46,44 +65,117 @@ class NoteApp:
         # Bind save on close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def create_ui(self):
-        # Configure style
+    # ------------------------------------------------------------------
+    # Style setup
+    # ------------------------------------------------------------------
+
+    def _setup_styles(self):
         style = ttk.Style()
         style.theme_use('clam')
 
+        style.configure('TFrame', background=C['bg'])
+        style.configure('TLabel', background=C['bg'], foreground=C['text'])
+
+        style.configure('TButton',
+                        background=C['surface'],
+                        foreground=C['text'],
+                        borderwidth=0,
+                        focusthickness=0,
+                        padding=(10, 5))
+        style.map('TButton',
+                  background=[('active', C['surface2']), ('pressed', C['surface2'])],
+                  relief=[('pressed', 'flat'), ('!pressed', 'flat')])
+
+        style.configure('Accent.TButton',
+                        background=C['accent'],
+                        foreground=C['bg'],
+                        borderwidth=0,
+                        focusthickness=0,
+                        padding=(10, 5))
+        style.map('Accent.TButton',
+                  background=[('active', C['accent_h']), ('pressed', C['accent_h'])],
+                  relief=[('pressed', 'flat'), ('!pressed', 'flat')])
+
+        style.configure('Danger.TButton',
+                        background=C['surface'],
+                        foreground=C['red'],
+                        borderwidth=0,
+                        focusthickness=0,
+                        padding=(10, 5))
+        style.map('Danger.TButton',
+                  background=[('active', C['surface2']), ('pressed', C['surface2'])],
+                  relief=[('pressed', 'flat'), ('!pressed', 'flat')])
+
+        style.configure('Vertical.TScrollbar',
+                        background=C['surface'],
+                        troughcolor=C['bg'],
+                        borderwidth=0,
+                        arrowsize=0)
+        style.map('Vertical.TScrollbar',
+                  background=[('active', C['surface2'])])
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def create_ui(self):
+        self._setup_styles()
+
         # Main container
-        main_container = ttk.Frame(self.root)
+        main_container = tk.Frame(self.root, bg=C['bg'])
         main_container.pack(fill=tk.BOTH, expand=True)
 
-        # Left sidebar for note list
-        sidebar = ttk.Frame(main_container, width=250)
-        sidebar.pack(side=tk.LEFT, fill=tk.BOTH, padx=(5, 0), pady=5)
+        # ── Left sidebar ──────────────────────────────────────────────
+        sidebar = tk.Frame(main_container, bg=C['sidebar'], width=250)
+        sidebar.pack(side=tk.LEFT, fill=tk.BOTH)
         sidebar.pack_propagate(False)
 
-        # Sidebar header
-        sidebar_header = ttk.Frame(sidebar)
-        sidebar_header.pack(fill=tk.X, pady=(0, 5))
+        # Inner padding frame
+        inner = tk.Frame(sidebar, bg=C['sidebar'])
+        inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
 
-        self.notes_header_label = ttk.Label(sidebar_header, text="Notes", font=('Segoe UI', 12, 'bold'))
+        # Sidebar header
+        sidebar_header = tk.Frame(inner, bg=C['sidebar'])
+        sidebar_header.pack(fill=tk.X, pady=(0, 8))
+
+        self.notes_header_label = tk.Label(
+            sidebar_header, text="Notes",
+            font=('Segoe UI', 13, 'bold'),
+            bg=C['sidebar'], fg=C['text']
+        )
         self.notes_header_label.pack(side=tk.LEFT)
 
-        new_btn = ttk.Button(sidebar_header, text="+", width=3, command=self.new_note)
+        new_btn = ttk.Button(sidebar_header, text="+", width=3,
+                             command=self.new_note, style='Accent.TButton')
         new_btn.pack(side=tk.RIGHT)
 
-        # Search box
-        search_frame = ttk.Frame(sidebar)
-        search_frame.pack(fill=tk.X, pady=(0, 5))
+        # ── Search box ────────────────────────────────────────────────
+        search_wrap = tk.Frame(inner, bg=C['surface'])
+        search_wrap.pack(fill=tk.X, pady=(0, 8))
+
+        search_icon = tk.Label(search_wrap, text="⌕",
+                               bg=C['surface'], fg=C['muted'],
+                               font=('Segoe UI', 11))
+        search_icon.pack(side=tk.LEFT, padx=(6, 2))
 
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        self.search_entry.pack(fill=tk.X)
+        self.search_entry = tk.Entry(
+            search_wrap,
+            textvariable=self.search_var,
+            bg=C['surface'], fg=C['muted'],
+            insertbackground=C['accent'],
+            relief=tk.FLAT,
+            font=('Segoe UI', 10),
+            bd=0
+        )
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=5, padx=(0, 6))
         self.search_entry.insert(0, "Search...")
         self.search_entry.bind('<FocusIn>', lambda e: self.on_search_focus_in(e))
         self.search_entry.bind('<FocusOut>', lambda e: self.on_search_focus_out(e))
         self.search_entry.bind('<Escape>', self._clear_search)
 
-        # Note list
-        list_frame = ttk.Frame(sidebar)
+        # ── Note listbox ──────────────────────────────────────────────
+        list_frame = tk.Frame(inner, bg=C['sidebar'])
         list_frame.pack(fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(list_frame)
@@ -96,7 +188,11 @@ class NoteApp:
             selectmode=tk.SINGLE,
             activestyle='none',
             borderwidth=0,
-            highlightthickness=0
+            highlightthickness=0,
+            bg=C['sidebar'],
+            fg=C['text'],
+            selectbackground=C['accent'],
+            selectforeground='#ffffff',
         )
         self.note_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.note_listbox.yview)
@@ -104,32 +200,48 @@ class NoteApp:
         self.note_listbox.bind('<<ListboxSelect>>', self.on_note_select)
         self.note_listbox.bind('<Double-Button-1>', self.rename_note)
         self.note_listbox.bind('<Delete>', lambda e: self.delete_note())
+        self.note_listbox.bind('<Motion>', self._on_list_motion)
+        self.note_listbox.bind('<Leave>', self._on_list_leave)
 
         # Now that listbox exists, we can set up the search trace
         self.search_var.trace_add('write', lambda *args: self.filter_notes())
 
-        # Right side - editor
-        editor_container = ttk.Frame(main_container)
-        editor_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # ── Vertical divider ──────────────────────────────────────────
+        tk.Frame(main_container, bg=C['surface2'], width=1).pack(
+            side=tk.LEFT, fill=tk.Y)
+
+        # ── Right side — editor ───────────────────────────────────────
+        editor_container = tk.Frame(main_container, bg=C['bg'])
+        editor_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         # Editor toolbar
-        toolbar = ttk.Frame(editor_container)
-        toolbar.pack(fill=tk.X, pady=(0, 5))
+        toolbar = tk.Frame(editor_container, bg=C['bg'])
+        toolbar.pack(fill=tk.X, padx=20, pady=(14, 10))
 
-        self.title_label = ttk.Label(toolbar, text="", font=('Segoe UI', 11))
+        self.title_label = tk.Label(
+            toolbar, text="",
+            font=('Segoe UI', 14, 'bold'),
+            bg=C['bg'], fg=C['text']
+        )
         self.title_label.pack(side=tk.LEFT)
 
-        delete_btn = ttk.Button(toolbar, text="Delete", command=self.delete_note)
+        delete_btn = ttk.Button(toolbar, text="Delete",
+                                command=self.delete_note, style='Danger.TButton')
         delete_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
-        save_txt_btn = ttk.Button(toolbar, text="Save TXT", command=self.export_as_txt)
+        save_txt_btn = ttk.Button(toolbar, text="Save TXT",
+                                  command=self.export_as_txt, style='TButton')
         save_txt_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
-        export_all_btn = ttk.Button(toolbar, text="Export All", command=self.export_all_notes)
+        export_all_btn = ttk.Button(toolbar, text="Export All",
+                                    command=self.export_all_notes, style='TButton')
         export_all_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
+        # Thin horizontal rule below toolbar
+        tk.Frame(editor_container, bg=C['surface2'], height=1).pack(fill=tk.X)
+
         # Text editor
-        editor_frame = ttk.Frame(editor_container)
+        editor_frame = tk.Frame(editor_container, bg=C['bg'])
         editor_frame.pack(fill=tk.BOTH, expand=True)
 
         text_font = font.Font(family="Consolas", size=11)
@@ -138,10 +250,18 @@ class NoteApp:
             editor_frame,
             wrap=tk.WORD,
             font=text_font,
-            borderwidth=1,
-            relief=tk.SOLID,
-            padx=10,
-            pady=10,
+            bg=C['bg'],
+            fg=C['text'],
+            insertbackground=C['accent'],
+            selectbackground=C['select'],
+            selectforeground=C['text'],
+            highlightthickness=0,
+            borderwidth=0,
+            relief=tk.FLAT,
+            padx=24,
+            pady=20,
+            spacing1=3,
+            spacing3=3,
             undo=True,
             maxundo=-1
         )
@@ -162,12 +282,52 @@ class NoteApp:
         self.root.bind('<Control-s>', lambda e: self.save_current_note())
         self.root.bind('<Control-d>', lambda e: self.delete_note())
 
-        # Status bar
-        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        # ── Status bar ────────────────────────────────────────────────
+        status_frame = tk.Frame(self.root, bg=C['surface'], height=26)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        status_frame.pack_propagate(False)
+
+        self.status_bar = tk.Label(
+            status_frame, text="Ready",
+            bg=C['surface'], fg=C['muted'],
+            font=('Segoe UI', 9),
+            anchor=tk.W,
+            padx=14
+        )
+        self.status_bar.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Populate note list
         self.update_note_list()
+
+    # ------------------------------------------------------------------
+    # Listbox hover effects
+    # ------------------------------------------------------------------
+
+    def _on_list_motion(self, event):
+        idx = self.note_listbox.nearest(event.y)
+        if idx == self._hovered_idx:
+            return
+        # Restore previous hovered item
+        if self._hovered_idx is not None:
+            sel = self.note_listbox.curselection()
+            if self._hovered_idx not in sel:
+                self.note_listbox.itemconfig(self._hovered_idx, bg=C['sidebar'])
+        # Highlight new item
+        self._hovered_idx = idx
+        sel = self.note_listbox.curselection()
+        if idx not in sel:
+            self.note_listbox.itemconfig(idx, bg=C['surface'])
+
+    def _on_list_leave(self, event):
+        if self._hovered_idx is not None:
+            sel = self.note_listbox.curselection()
+            if self._hovered_idx not in sel:
+                self.note_listbox.itemconfig(self._hovered_idx, bg=C['sidebar'])
+        self._hovered_idx = None
+
+    # ------------------------------------------------------------------
+    # Search helpers
+    # ------------------------------------------------------------------
 
     def _clear_search(self, event=None):
         self.search_var.set("")
@@ -177,20 +337,28 @@ class NoteApp:
     def on_search_focus_in(self, event):
         if self.search_var.get() == "Search...":
             self.search_var.set("")
+        self.search_entry.config(fg=C['text'])
 
     def on_search_focus_out(self, event):
         if self.search_var.get() == "":
             self.search_var.set("Search...")
+        if self.search_var.get() == "Search...":
+            self.search_entry.config(fg=C['muted'])
+
+    # ------------------------------------------------------------------
+    # Note list management
+    # ------------------------------------------------------------------
 
     def _rebuild_listbox(self, note_items):
         """Rebuild the listbox from (note_id, note_data) pairs and restore selection."""
+        self._hovered_idx = None
         self.note_listbox.delete(0, tk.END)
         self.displayed_note_ids = []
 
         for note_id, note_data in note_items:
             title = note_data.get('title', 'Untitled')
             display = title if len(title) <= 30 else title[:29] + '…'
-            self.note_listbox.insert(tk.END, display)
+            self.note_listbox.insert(tk.END, "  " + display)
             self.displayed_note_ids.append(note_id)
 
         # Empty-state placeholder
@@ -198,7 +366,7 @@ class NoteApp:
             searching = self.search_var.get() not in ('', 'Search...')
             msg = 'No results' if searching else 'Press + to create a note'
             self.note_listbox.insert(tk.END, msg)
-            self.note_listbox.itemconfig(0, fg='#999')
+            self.note_listbox.itemconfig(0, fg=C['muted'])
 
         # Update header count
         count = len(self.notes)
@@ -517,6 +685,12 @@ class NoteApp:
 
 def main():
     root = tk.Tk()
+    try:
+        from PIL import Image, ImageTk
+        _icon = ImageTk.PhotoImage(Image.open(Path(__file__).parent / "favicon.ico"))
+        root.iconphoto(True, _icon)
+    except Exception:
+        pass  # icon missing or invalid — not fatal
     app = NoteApp(root)
     root.mainloop()
 
