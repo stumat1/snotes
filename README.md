@@ -1,111 +1,90 @@
-# Simple Note Taking App
+# sNotes
 
-A lightweight, thoughtful note-taking application built with Python and tkinter for Windows.
+A lightweight, distraction-free note-taking app built with Python and tkinter for Windows.
 
 ## Features
 
-- **Auto-save** - Your notes are automatically saved as you type (after 1 second of inactivity)
-- **Search** - Quickly find notes by searching titles and content
-- **Clean Interface** - Distraction-free writing experience with a sidebar for navigation
-- **Persistent State** - Remembers your last note when you reopen the app
-- **File-based Storage** - Notes stored as JSON in your home directory (`~/.simple_notes/`)
-- **First-line Titles** - The first line of your note automatically becomes its title
-- **Keyboard-friendly** - Full undo/redo support (Ctrl+Z, Ctrl+Y)
+### Writing
+- **Auto-save** — Notes save automatically 1 second after you stop typing
+- **First-line titles** — The first line of your note becomes its title in the sidebar
+- **Auto-date new notes** — New notes are pre-titled with today's date (e.g. `24 February 2026`)
+- **Full undo/redo** — Ctrl+Z / Ctrl+Y for text changes; Ctrl+Z also restores a just-deleted note
+- **Tab indentation** — Tab inserts an indent; Shift+Tab removes one
+- **Clickable URLs** — `http://` and `https://` links open in your browser on click
+- **Find in note** — Ctrl+F opens an inline find bar with match highlighting and navigation
+
+### Organisation
+- **Search** — Filters notes by title and content as you type; shows match count in the header
+- **Pin notes** — Right-click → Pin to keep important notes at the top of the list
+- **Sort toggle** — Switch between last-modified and A–Z order with the Date/A–Z button
+- **Duplicate note** — Right-click → Duplicate to copy a note as a new one
+- **Delete with confirmation** — Notes with content ask for confirmation before deletion
+
+### Interface
+- **Notion-inspired theme** — Warm, clean light theme easy on the eyes
+- **Right-click context menu** — Pin/Unpin, Rename, Duplicate, Export as TXT, Delete
+- **Note count** — Header shows total notes; switches to "2 of 5" when searching
+- **Status bar** — Always shows time since last edit and word/character count
+- **Scroll memory** — Returns to your scroll position when switching back to a note
+- **Font size control** — Ctrl+= / Ctrl+- to resize the editor font; persists between sessions
+
+### Export
+- **Save as TXT** — Export the current note as a `.txt` file
+- **Export all** — Export every note to a folder of your choice
 
 ## Requirements
 
-- Python 3.6 or higher (Python comes with tkinter on Windows)
+- Python 3.6 or higher (tkinter is included with Python on Windows)
+- Optional: [Pillow](https://python-pillow.org/) for the custom window icon
 
-## Installation
-
-1. Save `note_app.py` to your preferred location
-2. That's it! No additional packages needed.
-
-## Usage
-
-### Running the App
+## Running the App
 
 ```bash
-python note_app.py
+python snotes.py
 ```
 
-Or simply double-click `note_app.py` in Windows Explorer.
+Or double-click `snotes.py` in Windows Explorer (if `.py` files are associated with Python).
 
-### Creating a New Note
+## Keyboard Shortcuts
 
-- Click the **+** button in the top-right of the sidebar
-- Or just start typing in an empty note
-
-### Searching Notes
-
-- Type in the search box at the top of the sidebar
-- Search looks through both titles and content
-- Clear the search to see all notes
-
-### Deleting a Note
-
-- Select the note you want to delete
-- Click the **Delete** button in the toolbar
-
-### Tips
-
-- **First line is the title**: Whatever you write on the first line becomes the note title in the sidebar
-- **Auto-save**: Your notes save automatically - no need to press Ctrl+S
-- **Quick access**: Notes are sorted by most recently modified at the top
+| Shortcut | Action |
+|---|---|
+| Ctrl+N | New note |
+| Ctrl+S | Save current note |
+| Ctrl+D | Delete current note |
+| Ctrl+Z | Undo text — or restore a just-deleted note |
+| Ctrl+Y | Redo |
+| Ctrl+F | Find in note |
+| Ctrl+/ | Focus the search box |
+| Ctrl+Shift+C | Copy entire note to clipboard |
+| Ctrl+= / Ctrl++ | Increase editor font size |
+| Ctrl+- | Decrease editor font size |
+| Ctrl+0 | Reset editor font size |
+| Tab | Indent |
+| Shift+Tab | De-indent |
+| Escape | Close find bar / clear search |
+| Delete | Delete selected note (sidebar focused) |
+| Double-click | Rename note (sidebar) |
 
 ## Data Storage
 
 Notes are stored in:
 ```
-Windows: C:\Users\YourUsername\.simple_notes\notes.json
+C:\Users\YourUsername\.simple_notes\
+  notes.json   — all note content
+  config.json  — window size, last note, font size, sort preference
 ```
 
-You can:
-- Back up this folder to preserve your notes
-- Sync it with cloud storage (Dropbox, OneDrive, etc.)
-- Version control it with git
-
-## Keyboard Shortcuts
-
-- **Ctrl+Z** - Undo
-- **Ctrl+Y** - Redo
-- **Ctrl+A** - Select all
-- **Ctrl+C** - Copy
-- **Ctrl+V** - Paste
-- **Ctrl+X** - Cut
-
-## Customization
-
-The code is clean and easy to modify. Some ideas:
-
-- Change the font in the `create_ui()` method (look for `text_font`)
-- Adjust the auto-save delay (currently 1000ms in `on_text_modified()`)
-- Modify the window size (default 900x600)
-- Change the sidebar width (currently 250px)
+To back up or sync your notes, copy the `.simple_notes` folder to cloud storage (OneDrive, Dropbox, etc.) or keep it under version control.
 
 ## Troubleshooting
 
 **App won't start:**
-- Make sure Python is installed: `python --version`
-- On some systems, try: `python3 note_app.py`
+- Confirm Python is installed: `python --version`
+- Try: `python3 snotes.py`
 
 **Can't find my notes:**
-- Notes are stored in `~/.simple_notes/notes.json`
-- On Windows: `C:\Users\YourUsername\.simple_notes\`
+- Notes are at `C:\Users\YourUsername\.simple_notes\notes.json`
 
-**Text is too small/large:**
-- Edit the `text_font = font.Font(family="Consolas", size=11)` line
-- Change the `size=11` to your preferred size
-
-## Why Python + tkinter?
-
-- ✅ No compilation needed - runs immediately
-- ✅ Native Windows look and feel
-- ✅ Works great with VS Code
-- ✅ No external dependencies to install
-- ✅ Lightweight and fast
-- ✅ Easy to read and modify the code
-
-## License
-
-Free to use and modify as you wish!
+**Icon not showing:**
+- Install Pillow: `pip install pillow`

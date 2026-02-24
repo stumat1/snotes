@@ -8,8 +8,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox, font, filedialog, simpledialog
 import json
 import os
+import re
+import webbrowser
 from datetime import datetime
 from pathlib import Path
+
+URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 # ---------------------------------------------------------------------------
 # Color palette
@@ -49,6 +53,12 @@ class NoteApp:
         self.auto_save_after_id = None
         self.displayed_note_ids = []  # Parallel list tracking note IDs shown in listbox
         self._hovered_idx = None
+        self._deleted_note = None     # (note_id, note_data) held for undo-delete
+        self.editor_font_size = self.config.get('editor_font_size', 11)
+        self._find_matches = []
+        self._find_idx = -1
+        self.sort_mode = self.config.get('sort_mode', 'modified')
+        self._scroll_positions = {}
 
         # Create UI
         self.create_ui()
@@ -149,6 +159,11 @@ class NoteApp:
                              command=self.new_note, style='Accent.TButton')
         new_btn.pack(side=tk.RIGHT)
 
+        sort_label = 'A–Z' if self.sort_mode == 'alpha' else 'Date'
+        self.sort_btn = ttk.Button(sidebar_header, text=sort_label, width=4,
+                                   command=self._toggle_sort, style='TButton')
+        self.sort_btn.pack(side=tk.RIGHT, padx=(0, 4))
+
         # ── Search box ────────────────────────────────────────────────
         search_wrap = tk.Frame(inner, bg=C['surface'])
         search_wrap.pack(fill=tk.X, pady=(0, 8))
@@ -202,6 +217,7 @@ class NoteApp:
         self.note_listbox.bind('<Delete>', lambda e: self.delete_note())
         self.note_listbox.bind('<Motion>', self._on_list_motion)
         self.note_listbox.bind('<Leave>', self._on_list_leave)
+        self.note_listbox.bind('<Button-3>', self._on_list_right_click)
 
         # Now that listbox exists, we can set up the search trace
         self.search_var.trace_add('write', lambda *args: self.filter_notes())
@@ -240,16 +256,51 @@ class NoteApp:
         # Thin horizontal rule below toolbar
         tk.Frame(editor_container, bg=C['surface2'], height=1).pack(fill=tk.X)
 
-        # Text editor
-        editor_frame = tk.Frame(editor_container, bg=C['bg'])
-        editor_frame.pack(fill=tk.BOTH, expand=True)
+        # Find bar (hidden by default; shown dynamically before editor_frame)
+        self.find_bar = tk.Frame(editor_container, bg=C['surface'])
+        find_inner = tk.Frame(self.find_bar, bg=C['surface'])
+        find_inner.pack(fill=tk.X, padx=12, pady=5)
 
-        text_font = font.Font(family="Consolas", size=11)
+        tk.Label(find_inner, text="Find", bg=C['surface'], fg=C['subtext'],
+                 font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.find_entry = tk.Entry(
+            find_inner, bg=C['bg'], fg=C['text'],
+            insertbackground=C['accent'], relief=tk.FLAT,
+            font=('Segoe UI', 10), highlightthickness=1,
+            highlightbackground=C['surface2'], highlightcolor=C['accent'],
+        )
+        self.find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        self.find_entry.bind('<KeyRelease>', lambda e: self._find_in_note())
+        self.find_entry.bind('<Return>', lambda e: self._find_next() or "break")
+        self.find_entry.bind('<Shift-Return>', lambda e: self._find_prev() or "break")
+        self.find_entry.bind('<Escape>', lambda e: self._hide_find_bar())
+
+        self.find_count_label = tk.Label(
+            find_inner, text="", bg=C['surface'], fg=C['muted'],
+            font=('Segoe UI', 9), width=8, anchor=tk.W,
+        )
+        self.find_count_label.pack(side=tk.LEFT, padx=(8, 4))
+
+        ttk.Button(find_inner, text="↑", width=2,
+                   command=self._find_prev, style='TButton').pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(find_inner, text="↓", width=2,
+                   command=self._find_next, style='TButton').pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(find_inner, text="✕", width=2,
+                   command=self._hide_find_bar, style='TButton').pack(side=tk.LEFT)
+
+        tk.Frame(self.find_bar, bg=C['surface2'], height=1).pack(fill=tk.X)
+
+        # Text editor
+        self.editor_frame = tk.Frame(editor_container, bg=C['bg'])
+        self.editor_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.text_font = font.Font(family="Consolas", size=self.editor_font_size)
 
         self.text_editor = tk.Text(
-            editor_frame,
+            self.editor_frame,
             wrap=tk.WORD,
-            font=text_font,
+            font=self.text_font,
             bg=C['bg'],
             fg=C['text'],
             insertbackground=C['accent'],
@@ -267,9 +318,25 @@ class NoteApp:
         )
         self.text_editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        text_scrollbar = ttk.Scrollbar(editor_frame, command=self.text_editor.yview)
+        text_scrollbar = ttk.Scrollbar(self.editor_frame, command=self.text_editor.yview)
         text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_editor.config(yscrollcommand=text_scrollbar.set)
+
+        # Find highlight tags ('find_current' configured last so it takes priority)
+        self.text_editor.tag_configure('find', background='#ffeea6')
+        self.text_editor.tag_configure('find_current', background='#f5c518')
+
+        # URL tag — blue underline, hand cursor on hover
+        self.text_editor.tag_configure('url', foreground=C['accent'], underline=True)
+        self.text_editor.tag_bind('url', '<Button-1>', self._open_url)
+        self.text_editor.tag_bind('url', '<Enter>',
+                                  lambda e: self.text_editor.config(cursor='hand2'))
+        self.text_editor.tag_bind('url', '<Leave>',
+                                  lambda e: self.text_editor.config(cursor=''))
+
+        # Tab inserts indentation instead of moving focus
+        self.text_editor.bind('<Tab>', self._on_tab)
+        self.text_editor.bind('<Shift-Tab>', self._on_shift_tab)
 
         # Bind text change to auto-save and live word count
         self.text_editor.bind('<<Modified>>', self.on_text_modified)
@@ -278,9 +345,17 @@ class NoteApp:
         # Keyboard shortcuts — bind Ctrl+N on the editor directly so "break"
         # prevents the Text widget's class binding from inserting a newline first
         self.text_editor.bind('<Control-n>', lambda e: self.new_note() or "break")
+        self.text_editor.bind('<Control-z>', self._on_ctrl_z)
         self.root.bind('<Control-n>', lambda e: self.new_note())
         self.root.bind('<Control-s>', lambda e: self.save_current_note())
         self.root.bind('<Control-d>', lambda e: self.delete_note())
+        self.root.bind('<Control-f>', lambda e: self._show_find_bar())
+        self.root.bind('<Control-slash>', lambda e: self._focus_search())
+        self.root.bind('<Control-Shift-c>', lambda e: self._copy_to_clipboard())
+        self.root.bind('<Control-equal>', lambda e: self._change_font_size(1))
+        self.root.bind('<Control-plus>', lambda e: self._change_font_size(1))
+        self.root.bind('<Control-minus>', lambda e: self._change_font_size(-1))
+        self.root.bind('<Control-0>', lambda e: self._change_font_size(0))
 
         # ── Status bar ────────────────────────────────────────────────
         status_frame = tk.Frame(self.root, bg=C['surface'], height=26)
@@ -325,9 +400,53 @@ class NoteApp:
                 self.note_listbox.itemconfig(self._hovered_idx, bg=C['sidebar'])
         self._hovered_idx = None
 
+    def _on_list_right_click(self, event):
+        idx = self.note_listbox.nearest(event.y)
+        if idx < 0 or idx >= len(self.displayed_note_ids):
+            return  # Clicked on placeholder or empty area
+
+        # Select the right-clicked note
+        self.note_listbox.selection_clear(0, tk.END)
+        self.note_listbox.selection_set(idx)
+        note_id = self.displayed_note_ids[idx]
+        if note_id != self.current_note_id:
+            self.save_current_note()
+            self.load_note(note_id)
+
+        is_pinned = self.notes.get(note_id, {}).get('pinned', False)
+        menu = tk.Menu(self.root, tearoff=0,
+                       bg=C['bg'], fg=C['text'],
+                       activebackground=C['accent'], activeforeground='#ffffff',
+                       font=('Segoe UI', 10), bd=0, relief=tk.FLAT)
+        menu.add_command(label="Unpin" if is_pinned else "Pin",
+                         command=lambda nid=note_id: self.toggle_pin(nid))
+        menu.add_separator()
+        menu.add_command(label="Rename", command=self.rename_note)
+        menu.add_command(label="Duplicate", command=self.duplicate_note)
+        menu.add_command(label="Export as TXT", command=self.export_as_txt)
+        menu.add_separator()
+        menu.add_command(label="Delete", command=self.delete_note,
+                         foreground=C['red'], activeforeground='#ffffff')
+
+        menu.tk_popup(event.x_root, event.y_root)
+
     # ------------------------------------------------------------------
     # Search helpers
     # ------------------------------------------------------------------
+
+    def _copy_to_clipboard(self):
+        content = self.text_editor.get('1.0', tk.END).strip()
+        if not content:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.status_bar.config(text="Copied to clipboard")
+        self.root.after(2000, self._update_status)
+
+    def _focus_search(self):
+        self.on_search_focus_in(None)
+        self.search_entry.focus_set()
+        self.search_entry.selection_range(0, tk.END)
 
     def _clear_search(self, event=None):
         self.search_var.set("")
@@ -358,7 +477,8 @@ class NoteApp:
         for note_id, note_data in note_items:
             title = note_data.get('title', 'Untitled')
             display = title if len(title) <= 30 else title[:29] + '…'
-            self.note_listbox.insert(tk.END, "  " + display)
+            prefix = "📌 " if note_data.get('pinned', False) else "  "
+            self.note_listbox.insert(tk.END, prefix + display)
             self.displayed_note_ids.append(note_id)
 
         # Empty-state placeholder
@@ -369,8 +489,14 @@ class NoteApp:
             self.note_listbox.itemconfig(0, fg=C['muted'])
 
         # Update header count
-        count = len(self.notes)
-        self.notes_header_label.config(text=f"Notes ({count})" if count else "Notes")
+        total = len(self.notes)
+        displayed = len(self.displayed_note_ids)
+        if total == 0:
+            self.notes_header_label.config(text="Notes")
+        elif displayed < total:
+            self.notes_header_label.config(text=f"Notes ({displayed} of {total})")
+        else:
+            self.notes_header_label.config(text=f"Notes ({total})")
 
         # Restore selection highlight for the current note
         if self.current_note_id in self.displayed_note_ids:
@@ -378,33 +504,32 @@ class NoteApp:
             self.note_listbox.selection_set(idx)
             self.note_listbox.see(idx)
 
+    def _sorted_notes(self, note_items):
+        """Sort notes with pinned always first, then by current sort mode."""
+        if self.sort_mode == 'alpha':
+            by_key = sorted(note_items, key=lambda x: x[1].get('title', '').lower())
+        else:
+            by_key = sorted(note_items, key=lambda x: x[1]['modified'], reverse=True)
+        return sorted(by_key, key=lambda x: x[1].get('pinned', False), reverse=True)
+
     def filter_notes(self):
         search_term = self.search_var.get().lower()
         if search_term == "search...":
             search_term = ""
 
-        sorted_notes = sorted(
-            self.notes.items(),
-            key=lambda x: x[1]['modified'],
-            reverse=True
-        )
+        notes = self._sorted_notes(self.notes.items())
 
         if search_term:
-            sorted_notes = [
-                (note_id, note_data) for note_id, note_data in sorted_notes
+            notes = [
+                (note_id, note_data) for note_id, note_data in notes
                 if search_term in note_data.get('title', '').lower()
                 or search_term in note_data.get('content', '').lower()
             ]
 
-        self._rebuild_listbox(sorted_notes)
+        self._rebuild_listbox(notes)
 
     def update_note_list(self):
-        sorted_notes = sorted(
-            self.notes.items(),
-            key=lambda x: x[1]['modified'],
-            reverse=True
-        )
-        self._rebuild_listbox(sorted_notes)
+        self._rebuild_listbox(self._sorted_notes(self.notes.items()))
 
     def on_note_select(self, event):
         selection = self.note_listbox.curselection()
@@ -419,6 +544,10 @@ class NoteApp:
 
     def load_note(self, note_id):
         if note_id in self.notes:
+            # Save scroll position of the note we're leaving
+            if self.current_note_id:
+                self._scroll_positions[self.current_note_id] = self.text_editor.yview()[0]
+
             self.current_note_id = note_id
             note_data = self.notes[note_id]
 
@@ -426,34 +555,59 @@ class NoteApp:
 
             self.text_editor.delete('1.0', tk.END)
             self.text_editor.insert('1.0', note_data.get('content', ''))
+            self._tag_urls()
 
             self.text_editor.edit_modified(False)
+
+            # Restore scroll position (deferred so content is fully rendered first)
+            fraction = self._scroll_positions.get(note_id, 0.0)
+            self.root.after(0, lambda f=fraction: self.text_editor.yview_moveto(f))
 
             self.config['last_note_id'] = note_id
             self.save_config()
 
             self.update_note_list()
-            modified = note_data.get('modified', '')
-            if modified:
-                self.status_bar.config(text=f"Last modified: {self._time_ago(modified)}")
-            else:
-                self._update_status()
+            self._update_status()
 
     def new_note(self):
         self.save_current_note()
 
-        note_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        now = datetime.now()
+        note_id = now.strftime("%Y%m%d_%H%M%S")
+        title = f"{now.day} {now.strftime('%B %Y')}"
 
         self.notes[note_id] = {
-            'title': 'New Note',
-            'content': '',
-            'created': datetime.now().isoformat(),
-            'modified': datetime.now().isoformat()
+            'title': title,
+            'content': title,
+            'created': now.isoformat(),
+            'modified': now.isoformat()
         }
 
         self.current_note_id = note_id
         self.load_note(note_id)
+        self.text_editor.mark_set('insert', '2.0')
         self.text_editor.focus_set()
+
+    def duplicate_note(self):
+        if not self.current_note_id or self.current_note_id not in self.notes:
+            return
+        self.save_current_note()
+        source = self.notes[self.current_note_id]
+        new_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        new_title = f"Copy of {source.get('title', 'Untitled')}"
+        new_content = source.get('content', '')
+        # Replace just the first line with the new title
+        lines = new_content.split('\n')
+        lines[0] = new_title
+        new_content = '\n'.join(lines)
+        self.notes[new_id] = {
+            'title': new_title[:50],
+            'content': new_content,
+            'created': datetime.now().isoformat(),
+            'modified': datetime.now().isoformat(),
+        }
+        self.save_notes()
+        self.load_note(new_id)
 
     def delete_note(self):
         if not self.current_note_id:
@@ -464,6 +618,7 @@ class NoteApp:
             return
 
         if self.current_note_id in self.notes:
+            self._deleted_note = (self.current_note_id, dict(self.notes[self.current_note_id]))
             del self.notes[self.current_note_id]
             self.save_notes()
 
@@ -473,7 +628,142 @@ class NoteApp:
             else:
                 self.new_note()
 
-            self.status_bar.config(text="Note deleted")
+            self.text_editor.focus_set()
+            self.status_bar.config(text="Note deleted  ·  Ctrl+Z to undo")
+
+    def _on_ctrl_z(self, event):
+        if self._deleted_note is not None:
+            self._restore_deleted_note()
+            return "break"
+        try:
+            self.text_editor.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _toggle_sort(self):
+        self.sort_mode = 'alpha' if self.sort_mode == 'modified' else 'modified'
+        self.sort_btn.config(text='A–Z' if self.sort_mode == 'alpha' else 'Date')
+        self.config['sort_mode'] = self.sort_mode
+        self.save_config()
+        self.update_note_list()
+
+    def toggle_pin(self, note_id):
+        if note_id not in self.notes:
+            return
+        self.notes[note_id]['pinned'] = not self.notes[note_id].get('pinned', False)
+        self.save_notes()
+        self.update_note_list()
+
+    def _on_tab(self, event):
+        self.text_editor.insert(tk.INSERT, '\t')
+        return "break"
+
+    def _on_shift_tab(self, event):
+        line_start = self.text_editor.index('insert linestart')
+        line_text = self.text_editor.get(line_start, f'{line_start} lineend')
+        if line_text.startswith('\t'):
+            self.text_editor.delete(line_start, f'{line_start} + 1 chars')
+        elif line_text.startswith('    '):
+            self.text_editor.delete(line_start, f'{line_start} + 4 chars')
+        elif line_text.startswith(' '):
+            # Remove however many leading spaces exist (up to 3)
+            spaces = len(line_text) - len(line_text.lstrip(' '))
+            self.text_editor.delete(line_start, f'{line_start} + {min(spaces, 3)} chars')
+        return "break"
+
+    def _show_find_bar(self):
+        self.find_bar.pack(fill=tk.X, before=self.editor_frame)
+        self.find_entry.focus_set()
+        self.find_entry.selection_range(0, tk.END)
+        self._find_in_note()
+
+    def _hide_find_bar(self):
+        self.find_bar.pack_forget()
+        self.text_editor.tag_remove('find', '1.0', tk.END)
+        self.text_editor.tag_remove('find_current', '1.0', tk.END)
+        self._find_matches = []
+        self._find_idx = -1
+        self.find_count_label.config(text="")
+        self.text_editor.focus_set()
+
+    def _find_in_note(self):
+        query = self.find_entry.get()
+        self.text_editor.tag_remove('find', '1.0', tk.END)
+        self.text_editor.tag_remove('find_current', '1.0', tk.END)
+        self._find_matches = []
+        self._find_idx = -1
+
+        if not query:
+            self.find_count_label.config(text="")
+            return
+
+        content = self.text_editor.get('1.0', tk.END)
+        query_lower = query.lower()
+        content_lower = content.lower()
+        pos = 0
+        while True:
+            idx = content_lower.find(query_lower, pos)
+            if idx == -1:
+                break
+            start = f"1.0 + {idx} chars"
+            end = f"1.0 + {idx + len(query)} chars"
+            self.text_editor.tag_add('find', start, end)
+            self._find_matches.append((start, end))
+            pos = idx + 1
+
+        if self._find_matches:
+            self._find_idx = 0
+            self._highlight_current_match()
+        else:
+            self.find_count_label.config(text="No results")
+
+    def _highlight_current_match(self):
+        self.text_editor.tag_remove('find_current', '1.0', tk.END)
+        if not self._find_matches:
+            return
+        start, end = self._find_matches[self._find_idx]
+        self.text_editor.tag_add('find_current', start, end)
+        self.text_editor.see(start)
+        self.find_count_label.config(
+            text=f"{self._find_idx + 1} of {len(self._find_matches)}")
+
+    def _find_next(self):
+        if not self._find_matches:
+            return
+        self._find_idx = (self._find_idx + 1) % len(self._find_matches)
+        self._highlight_current_match()
+
+    def _find_prev(self):
+        if not self._find_matches:
+            return
+        self._find_idx = (self._find_idx - 1) % len(self._find_matches)
+        self._highlight_current_match()
+
+    def _tag_urls(self):
+        self.text_editor.tag_remove('url', '1.0', tk.END)
+        content = self.text_editor.get('1.0', tk.END)
+        for match in URL_RE.finditer(content):
+            start = f"1.0 + {match.start()} chars"
+            end = f"1.0 + {match.end()} chars"
+            self.text_editor.tag_add('url', start, end)
+
+    def _open_url(self, event):
+        idx = self.text_editor.index(f"@{event.x},{event.y}")
+        for start, end in zip(*[iter(self.text_editor.tag_ranges('url'))] * 2):
+            if self.text_editor.compare(start, '<=', idx) and \
+               self.text_editor.compare(idx, '<=', end):
+                webbrowser.open(self.text_editor.get(start, end))
+                break
+
+    def _restore_deleted_note(self):
+        note_id, note_data = self._deleted_note
+        self._deleted_note = None
+        self.notes[note_id] = note_data
+        self.save_notes()
+        self.load_note(note_id)
+        self.status_bar.config(text="Note restored")
+        self.root.after(3000, self._update_status)
 
     def on_text_modified(self, event):
         if self.text_editor.edit_modified():
@@ -482,7 +772,9 @@ class NoteApp:
             self.auto_save_after_id = self.root.after(1000, self.auto_save)
 
     def auto_save(self):
+        self._deleted_note = None
         self.save_current_note()
+        self._tag_urls()
         self.status_bar.config(text=f"Auto-saved  ·  {self._word_count_text()}")
         self.root.after(2000, self._update_status)
 
@@ -494,8 +786,24 @@ class NoteApp:
         chars = len(content)
         return f"{words} word{'s' if words != 1 else ''}  ·  {chars} chars"
 
+    def _change_font_size(self, delta):
+        if delta == 0:
+            self.editor_font_size = 11
+        else:
+            self.editor_font_size = max(8, min(28, self.editor_font_size + delta))
+        self.text_font.configure(size=self.editor_font_size)
+        self.config['editor_font_size'] = self.editor_font_size
+        self.save_config()
+
     def _update_status(self):
-        self.status_bar.config(text=self._word_count_text())
+        parts = []
+        modified = self.notes.get(self.current_note_id, {}).get('modified', '')
+        if modified:
+            parts.append(self._time_ago(modified))
+        wc = self._word_count_text()
+        if wc:
+            parts.append(wc)
+        self.status_bar.config(text="  ·  ".join(parts) if parts else "Ready")
 
     def _time_ago(self, iso_string):
         try:
