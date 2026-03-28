@@ -2,6 +2,8 @@
 
 A lightweight, distraction-free note-taking app built with Python and tkinter for Windows.
 
+<img width="545" height="371" alt="sNotesScreenshot20260328" src="https://github.com/user-attachments/assets/91fabfe7-b9b5-4079-a829-fb74c870f910" />
+
 ## Features
 
 ### Writing
