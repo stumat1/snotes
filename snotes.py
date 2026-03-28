@@ -4,11 +4,12 @@ Simple Note Taking App
 A lightweight, thoughtful note-taking application with auto-save and search.
 """
 
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, font, filedialog, simpledialog
 import json
-import os
 import re
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,39 @@ except Exception:
         pass
 
 URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+_lock_fh = None  # kept alive for the process lifetime; releasing it drops the OS lock
+
+
+def _acquire_single_instance_lock(lock_path: Path) -> bool:
+    """Return True if this is the only running instance, False if another is open."""
+    global _lock_fh
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            _lock_fh = open(lock_path, 'w')
+            try:
+                msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                _lock_fh.close()
+                _lock_fh = None
+                return False
+        else:
+            import fcntl
+            _lock_fh = open(lock_path, 'w')
+            try:
+                fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                _lock_fh.close()
+                _lock_fh = None
+                return False
+    except Exception:
+        return True  # can't determine — allow startup
 
 # ---------------------------------------------------------------------------
 # Color palette
@@ -738,7 +772,7 @@ class NoteApp:
         self.save_current_note()
 
         now = datetime.now()
-        note_id = now.strftime("%Y%m%d_%H%M%S")
+        note_id = uuid.uuid4().hex
 
         self.notes[note_id] = {
             'title': '',
@@ -757,7 +791,7 @@ class NoteApp:
             return
         self.save_current_note()
         source = self.notes[self.current_note_id]
-        new_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        new_id = uuid.uuid4().hex
         base_title = source.get('title', 'Untitled')
         if base_title.startswith("Copy of "):
             base_title = base_title[len("Copy of "):]
@@ -1046,7 +1080,7 @@ class NoteApp:
                 d = seconds // 86400
                 return f"{d} day{'s' if d != 1 else ''} ago"
             elif dt.year == datetime.now().year:
-                return dt.strftime("%b %#d")
+                return f"{dt.strftime('%b')} {dt.day}"
             else:
                 return dt.strftime("%Y/%m/%d")
         except Exception:
@@ -1157,6 +1191,7 @@ class NoteApp:
 
         folder_path = Path(folder)
         saved = 0
+        failed = 0
         for note_id, note_data in self.notes.items():
             content = note_data.get('content', '').strip()
             if not content:
@@ -1172,9 +1207,12 @@ class NoteApp:
                 file_path.write_text(content, encoding='utf-8')
                 saved += 1
             except Exception:
-                pass
+                failed += 1
 
-        self.status_bar.config(text=f"Exported {saved} note{'s' if saved != 1 else ''} to {folder_path.name}/")
+        if failed:
+            self.status_bar.config(text=f"Exported {saved} note{'s' if saved != 1 else ''}  ·  {failed} failed — check folder permissions")
+        else:
+            self.status_bar.config(text=f"Exported {saved} note{'s' if saved != 1 else ''} to {folder_path.name}/")
         self.root.after(4000, self._update_status)
 
     def export_as_txt(self):
@@ -1219,8 +1257,9 @@ class NoteApp:
 
     def save_notes(self):
         try:
-            with open(self.notes_file, 'w', encoding='utf-8') as f:
-                json.dump(self.notes, f, indent=2, ensure_ascii=False)
+            tmp = self.notes_file.with_suffix('.tmp')
+            tmp.write_text(json.dumps(self.notes, indent=2, ensure_ascii=False), encoding='utf-8')
+            tmp.replace(self.notes_file)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save notes: {e}")
 
@@ -1235,10 +1274,13 @@ class NoteApp:
 
     def save_config(self):
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2)
-        except Exception:
-            pass
+            tmp = self.config_file.with_suffix('.tmp')
+            tmp.write_text(json.dumps(self.config, indent=2), encoding='utf-8')
+            tmp.replace(self.config_file)
+        except Exception as e:
+            if hasattr(self, 'status_bar'):
+                self.status_bar.config(text=f"Warning: settings not saved — {e}")
+                self.root.after(4000, self._update_status)
 
     def on_closing(self):
         self.config['geometry'] = self.root.geometry()
@@ -1251,6 +1293,16 @@ class NoteApp:
 
 
 def main():
+    data_dir = Path.home() / ".simple_notes"
+    data_dir.mkdir(exist_ok=True)
+    if not _acquire_single_instance_lock(data_dir / "app.lock"):
+        _tmp = tk.Tk()
+        _tmp.withdraw()
+        messagebox.showwarning("Already Running",
+                               "sNotes is already open.\nCheck your taskbar.")
+        _tmp.destroy()
+        return
+
     root = tk.Tk()
     try:
         from PIL import Image, ImageTk

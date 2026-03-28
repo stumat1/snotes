@@ -1,0 +1,3 @@
+# All core dependencies are Python stdlib (tkinter, json, re, uuid, pathlib, webbrowser, ctypes).
+# Pillow is optional — used only for the window icon.
+Pillow>=9.0
