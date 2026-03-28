@@ -13,6 +13,16 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+# Enable per-monitor DPI awareness on Windows to prevent blurry fonts
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+    except Exception:
+        pass
+
 URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 # ---------------------------------------------------------------------------
@@ -33,6 +43,33 @@ C = {
 }
 
 
+class _Tooltip:
+    """Minimal hover tooltip for a tkinter widget."""
+    def __init__(self, widget, text_fn):
+        self._widget = widget
+        self._text_fn = text_fn
+        self._tip = None
+        widget.bind('<Enter>', self._show)
+        widget.bind('<Leave>', self._hide)
+
+    def _show(self, _):
+        text = self._text_fn()
+        if not text:
+            return
+        x = self._widget.winfo_rootx() + 10
+        y = self._widget.winfo_rooty() - 28
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=text, bg='#fffde7', fg=C['text'],
+                 font=('Segoe UI', 9), relief=tk.FLAT, padx=6, pady=3).pack()
+
+    def _hide(self, _):
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
 class NoteApp:
     def __init__(self, root):
         self.root = root
@@ -48,7 +85,22 @@ class NoteApp:
         # Load notes and config
         self.notes = self.load_notes()
         self.config = self.load_config()
-        self.root.geometry(self.config.get('geometry', '900x600'))
+        min_w, min_h = 1100, 700
+        w, h = min_w, min_h
+        saved = self.config.get('geometry', '')
+        if saved:
+            try:
+                sw, sh = (int(x) for x in saved.split('+')[0].split('x'))
+                w, h = max(sw, min_w), max(sh, min_h)
+            except Exception:
+                pass
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.minsize(min_w, min_h)
         self.current_note_id = self.config.get("last_note_id")
         self.auto_save_after_id = None
         self.displayed_note_ids = []  # Parallel list tracking note IDs shown in listbox
@@ -57,8 +109,12 @@ class NoteApp:
         self.editor_font_size = self.config.get('editor_font_size', 11)
         self._find_matches = []
         self._find_idx = -1
+        self._find_case_sensitive = False
         self.sort_mode = self.config.get('sort_mode', 'modified')
-        self._scroll_positions = {}
+        self._scroll_positions = self.config.get('scroll_positions', {})
+        self.sidebar_width = self.config.get('sidebar_width', 250)
+        self._drag_start_x = 0
+        self._drag_start_width = self.sidebar_width
 
         # Create UI
         self.create_ui()
@@ -93,6 +149,15 @@ class NoteApp:
                         focusthickness=0,
                         padding=(10, 5))
         style.map('TButton',
+                  background=[('active', C['surface2']), ('pressed', C['surface2'])],
+                  relief=[('pressed', 'flat'), ('!pressed', 'flat')])
+        style.configure('Compact.TButton',
+                        background=C['surface'],
+                        foreground=C['text'],
+                        borderwidth=0,
+                        focusthickness=0,
+                        padding=(4, 5))
+        style.map('Compact.TButton',
                   background=[('active', C['surface2']), ('pressed', C['surface2'])],
                   relief=[('pressed', 'flat'), ('!pressed', 'flat')])
 
@@ -136,9 +201,10 @@ class NoteApp:
         main_container.pack(fill=tk.BOTH, expand=True)
 
         # ── Left sidebar ──────────────────────────────────────────────
-        sidebar = tk.Frame(main_container, bg=C['sidebar'], width=250)
-        sidebar.pack(side=tk.LEFT, fill=tk.BOTH)
-        sidebar.pack_propagate(False)
+        self.sidebar = tk.Frame(main_container, bg=C['sidebar'], width=self.sidebar_width)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.BOTH)
+        self.sidebar.pack_propagate(False)
+        sidebar = self.sidebar  # local alias for the rest of create_ui
 
         # Inner padding frame
         inner = tk.Frame(sidebar, bg=C['sidebar'])
@@ -160,8 +226,8 @@ class NoteApp:
         new_btn.pack(side=tk.RIGHT)
 
         sort_label = 'A–Z' if self.sort_mode == 'alpha' else 'Date'
-        self.sort_btn = ttk.Button(sidebar_header, text=sort_label, width=4,
-                                   command=self._toggle_sort, style='TButton')
+        self.sort_btn = ttk.Button(sidebar_header, text=sort_label, width=5,
+                                   command=self._toggle_sort, style='Compact.TButton')
         self.sort_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
         # ── Search box ────────────────────────────────────────────────
@@ -188,6 +254,7 @@ class NoteApp:
         self.search_entry.bind('<FocusIn>', lambda e: self.on_search_focus_in(e))
         self.search_entry.bind('<FocusOut>', lambda e: self.on_search_focus_out(e))
         self.search_entry.bind('<Escape>', self._clear_search)
+        self.search_entry.bind('<Down>', self._focus_note_list)
 
         # ── Note listbox ──────────────────────────────────────────────
         list_frame = tk.Frame(inner, bg=C['sidebar'])
@@ -218,13 +285,19 @@ class NoteApp:
         self.note_listbox.bind('<Motion>', self._on_list_motion)
         self.note_listbox.bind('<Leave>', self._on_list_leave)
         self.note_listbox.bind('<Button-3>', self._on_list_right_click)
+        self.note_listbox.bind('<Up>', self._on_list_arrow)
+        self.note_listbox.bind('<Down>', self._on_list_arrow)
 
         # Now that listbox exists, we can set up the search trace
         self.search_var.trace_add('write', lambda *args: self.filter_notes())
 
-        # ── Vertical divider ──────────────────────────────────────────
-        tk.Frame(main_container, bg=C['surface2'], width=1).pack(
-            side=tk.LEFT, fill=tk.Y)
+        # ── Vertical divider (drag to resize) ────────────────────────
+        divider = tk.Frame(main_container, bg=C['surface2'], width=4,
+                           cursor='sb_h_double_arrow')
+        divider.pack(side=tk.LEFT, fill=tk.Y)
+        divider.bind('<ButtonPress-1>', self._on_divider_press)
+        divider.bind('<B1-Motion>', self._on_divider_drag)
+        divider.bind('<ButtonRelease-1>', self._on_divider_release)
 
         # ── Right side — editor ───────────────────────────────────────
         editor_container = tk.Frame(main_container, bg=C['bg'])
@@ -234,12 +307,15 @@ class NoteApp:
         toolbar = tk.Frame(editor_container, bg=C['bg'])
         toolbar.pack(fill=tk.X, padx=20, pady=(14, 10))
 
-        self.title_label = tk.Label(
-            toolbar, text="",
-            font=('Segoe UI', 14, 'bold'),
-            bg=C['bg'], fg=C['text']
+        self.title_entry = tk.Entry(
+            toolbar, font=('Segoe UI', 14, 'bold'),
+            bg=C['bg'], fg=C['text'],
+            insertbackground=C['accent'],
+            relief=tk.FLAT, highlightthickness=0, borderwidth=0,
         )
-        self.title_label.pack(side=tk.LEFT)
+        self.title_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.title_entry.bind('<Return>', self._on_title_edit)
+        self.title_entry.bind('<FocusOut>', self._on_title_edit)
 
         delete_btn = ttk.Button(toolbar, text="Delete",
                                 command=self.delete_note, style='Danger.TButton')
@@ -282,12 +358,42 @@ class NoteApp:
         )
         self.find_count_label.pack(side=tk.LEFT, padx=(8, 4))
 
+        self.case_btn = tk.Label(
+            find_inner, text="Aa", cursor='hand2',
+            bg=C['surface'], fg=C['muted'],
+            font=('Segoe UI', 9, 'bold'), padx=4, pady=2,
+        )
+        self.case_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.case_btn.bind('<Button-1>', lambda _: self._toggle_case_sensitive())
+
         ttk.Button(find_inner, text="↑", width=2,
                    command=self._find_prev, style='TButton').pack(side=tk.LEFT, padx=(0, 2))
         ttk.Button(find_inner, text="↓", width=2,
                    command=self._find_next, style='TButton').pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(find_inner, text="✕", width=2,
                    command=self._hide_find_bar, style='TButton').pack(side=tk.LEFT)
+
+        # Replace row
+        replace_inner = tk.Frame(self.find_bar, bg=C['surface'])
+        replace_inner.pack(fill=tk.X, padx=12, pady=(0, 5))
+
+        tk.Label(replace_inner, text="Replace", bg=C['surface'], fg=C['subtext'],
+                 font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.replace_entry = tk.Entry(
+            replace_inner, bg=C['bg'], fg=C['text'],
+            insertbackground=C['accent'], relief=tk.FLAT,
+            font=('Segoe UI', 10), highlightthickness=1,
+            highlightbackground=C['surface2'], highlightcolor=C['accent'],
+        )
+        self.replace_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        self.replace_entry.bind('<Return>', lambda _: self._replace_one() or "break")
+        self.replace_entry.bind('<Escape>', lambda _: self._hide_find_bar())
+
+        ttk.Button(replace_inner, text="Replace", style='TButton',
+                   command=self._replace_one).pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(replace_inner, text="Replace All", style='TButton',
+                   command=self._replace_all).pack(side=tk.LEFT)
 
         tk.Frame(self.find_bar, bg=C['surface2'], height=1).pack(fill=tk.X)
 
@@ -350,12 +456,16 @@ class NoteApp:
         self.root.bind('<Control-s>', lambda e: self.save_current_note())
         self.root.bind('<Control-d>', lambda e: self.delete_note())
         self.root.bind('<Control-f>', lambda e: self._show_find_bar())
+        self.root.bind('<Control-h>', lambda e: self._show_find_bar(focus_replace=True))
         self.root.bind('<Control-slash>', lambda e: self._focus_search())
         self.root.bind('<Control-Shift-c>', lambda e: self._copy_to_clipboard())
         self.root.bind('<Control-equal>', lambda e: self._change_font_size(1))
         self.root.bind('<Control-plus>', lambda e: self._change_font_size(1))
         self.root.bind('<Control-minus>', lambda e: self._change_font_size(-1))
         self.root.bind('<Control-0>', lambda e: self._change_font_size(0))
+        self.root.bind('<Control-w>', lambda e: self.on_closing())
+        self.root.bind('<Control-q>', lambda e: self.on_closing())
+        self.root.bind('<F2>', lambda _: self.rename_note())
 
         # ── Status bar ────────────────────────────────────────────────
         status_frame = tk.Frame(self.root, bg=C['surface'], height=26)
@@ -370,6 +480,7 @@ class NoteApp:
             padx=14
         )
         self.status_bar.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _Tooltip(self.status_bar, self._created_tooltip_text)
 
         # Populate note list
         self.update_note_list()
@@ -377,6 +488,20 @@ class NoteApp:
     # ------------------------------------------------------------------
     # Listbox hover effects
     # ------------------------------------------------------------------
+
+    def _on_divider_press(self, event):
+        self._drag_start_x = event.x_root
+        self._drag_start_width = self.sidebar.winfo_width()
+
+    def _on_divider_drag(self, event):
+        delta = event.x_root - self._drag_start_x
+        new_width = max(150, min(500, self._drag_start_width + delta))
+        self.sidebar.config(width=new_width)
+
+    def _on_divider_release(self, _):
+        self.sidebar_width = self.sidebar.winfo_width()
+        self.config['sidebar_width'] = self.sidebar_width
+        self.save_config()
 
     def _on_list_motion(self, event):
         idx = self.note_listbox.nearest(event.y)
@@ -400,6 +525,33 @@ class NoteApp:
                 self.note_listbox.itemconfig(self._hovered_idx, bg=C['sidebar'])
         self._hovered_idx = None
 
+    def _on_list_arrow(self, event):
+        size = len(self.displayed_note_ids)
+        if size == 0:
+            return "break"
+        try:
+            current = self.displayed_note_ids.index(self.current_note_id)
+        except ValueError:
+            current = 0
+        if event.keysym == 'Up':
+            new_idx = max(0, current - 1)
+        else:
+            new_idx = min(size - 1, current + 1)
+        if new_idx != current:
+            self.save_current_note()
+            self.load_note(self.displayed_note_ids[new_idx])
+        return "break"
+
+    def _focus_note_list(self, _event=None):
+        if self.note_listbox.size() == 0:
+            return
+        sel = self.note_listbox.curselection()
+        if not sel:
+            self.note_listbox.selection_set(0)
+            self.note_listbox.event_generate('<<ListboxSelect>>')
+        self.note_listbox.focus_set()
+        return "break"
+
     def _on_list_right_click(self, event):
         idx = self.note_listbox.nearest(event.y)
         if idx < 0 or idx >= len(self.displayed_note_ids):
@@ -418,6 +570,11 @@ class NoteApp:
                        bg=C['bg'], fg=C['text'],
                        activebackground=C['accent'], activeforeground='#ffffff',
                        font=('Segoe UI', 10), bd=0, relief=tk.FLAT)
+        created = self.notes.get(note_id, {}).get('created', '')
+        if created:
+            menu.add_command(label=f"Created {self._time_ago(created)}",
+                             state='disabled', foreground=C['muted'])
+            menu.add_separator()
         menu.add_command(label="Unpin" if is_pinned else "Pin",
                          command=lambda nid=note_id: self.toggle_pin(nid))
         menu.add_separator()
@@ -517,6 +674,11 @@ class NoteApp:
         if search_term == "search...":
             search_term = ""
 
+        # Reflect live editor content so unsaved edits are searchable
+        if search_term and self.current_note_id and self.current_note_id in self.notes:
+            live = self.text_editor.get('1.0', tk.END).strip()
+            self.notes[self.current_note_id]['content'] = live
+
         notes = self._sorted_notes(self.notes.items())
 
         if search_term:
@@ -551,7 +713,10 @@ class NoteApp:
             self.current_note_id = note_id
             note_data = self.notes[note_id]
 
-            self.title_label.config(text=note_data.get('title', 'Untitled'))
+            title = note_data.get('title', 'Untitled')
+            self.title_entry.delete(0, tk.END)
+            self.title_entry.insert(0, title)
+            self.root.title(f"Notes \u2014 {title}")
 
             self.text_editor.delete('1.0', tk.END)
             self.text_editor.insert('1.0', note_data.get('content', ''))
@@ -574,18 +739,17 @@ class NoteApp:
 
         now = datetime.now()
         note_id = now.strftime("%Y%m%d_%H%M%S")
-        title = f"{now.day} {now.strftime('%B %Y')}"
 
         self.notes[note_id] = {
-            'title': title,
-            'content': title,
+            'title': '',
+            'content': '',
             'created': now.isoformat(),
             'modified': now.isoformat()
         }
 
         self.current_note_id = note_id
         self.load_note(note_id)
-        self.text_editor.mark_set('insert', '2.0')
+        self.text_editor.mark_set('insert', '1.0')
         self.text_editor.focus_set()
 
     def duplicate_note(self):
@@ -594,7 +758,10 @@ class NoteApp:
         self.save_current_note()
         source = self.notes[self.current_note_id]
         new_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_title = f"Copy of {source.get('title', 'Untitled')}"
+        base_title = source.get('title', 'Untitled')
+        if base_title.startswith("Copy of "):
+            base_title = base_title[len("Copy of "):]
+        new_title = f"Copy of {base_title}"
         new_content = source.get('content', '')
         # Replace just the first line with the new title
         lines = new_content.split('\n')
@@ -672,10 +839,14 @@ class NoteApp:
             self.text_editor.delete(line_start, f'{line_start} + {min(spaces, 3)} chars')
         return "break"
 
-    def _show_find_bar(self):
+    def _show_find_bar(self, focus_replace=False):
         self.find_bar.pack(fill=tk.X, before=self.editor_frame)
-        self.find_entry.focus_set()
-        self.find_entry.selection_range(0, tk.END)
+        if focus_replace:
+            self.replace_entry.focus_set()
+            self.replace_entry.selection_range(0, tk.END)
+        else:
+            self.find_entry.focus_set()
+            self.find_entry.selection_range(0, tk.END)
         self._find_in_note()
 
     def _hide_find_bar(self):
@@ -685,6 +856,8 @@ class NoteApp:
         self._find_matches = []
         self._find_idx = -1
         self.find_count_label.config(text="")
+        self._find_case_sensitive = False
+        self.case_btn.config(fg=C['muted'])
         self.text_editor.focus_set()
 
     def _find_in_note(self):
@@ -699,11 +872,13 @@ class NoteApp:
             return
 
         content = self.text_editor.get('1.0', tk.END)
-        query_lower = query.lower()
-        content_lower = content.lower()
+        if self._find_case_sensitive:
+            search_content, search_query = content, query
+        else:
+            search_content, search_query = content.lower(), query.lower()
         pos = 0
         while True:
-            idx = content_lower.find(query_lower, pos)
+            idx = search_content.find(search_query, pos)
             if idx == -1:
                 break
             start = f"1.0 + {idx} chars"
@@ -733,6 +908,36 @@ class NoteApp:
             return
         self._find_idx = (self._find_idx + 1) % len(self._find_matches)
         self._highlight_current_match()
+
+    def _toggle_case_sensitive(self):
+        self._find_case_sensitive = not self._find_case_sensitive
+        active_fg = C['accent'] if self._find_case_sensitive else C['muted']
+        self.case_btn.config(fg=active_fg)
+        self._find_in_note()
+
+    def _replace_one(self):
+        if not self._find_matches or self._find_idx < 0:
+            return
+        replacement = self.replace_entry.get()
+        start, end = self._find_matches[self._find_idx]
+        self.text_editor.delete(start, end)
+        self.text_editor.insert(start, replacement)
+        self._find_in_note()
+
+    def _replace_all(self):
+        query = self.find_entry.get()
+        if not query:
+            return
+        replacement = self.replace_entry.get()
+        self._find_in_note()
+        if not self._find_matches:
+            return
+        for start, end in reversed(self._find_matches):
+            self.text_editor.delete(start, end)
+            self.text_editor.insert(start, replacement)
+        count = len(self._find_matches)
+        self._find_in_note()
+        self.find_count_label.config(text=f"{count} replaced")
 
     def _find_prev(self):
         if not self._find_matches:
@@ -772,10 +977,14 @@ class NoteApp:
             self.auto_save_after_id = self.root.after(1000, self.auto_save)
 
     def auto_save(self):
+        undo_expired = self._deleted_note is not None
         self._deleted_note = None
         self.save_current_note()
         self._tag_urls()
-        self.status_bar.config(text=f"Auto-saved  ·  {self._word_count_text()}")
+        if undo_expired:
+            self.status_bar.config(text=f"Auto-saved  ·  Undo window expired  ·  {self._word_count_text()}")
+        else:
+            self.status_bar.config(text=f"Auto-saved  ·  {self._word_count_text()}")
         self.root.after(2000, self._update_status)
 
     def _word_count_text(self):
@@ -803,7 +1012,23 @@ class NoteApp:
         wc = self._word_count_text()
         if wc:
             parts.append(wc)
+        try:
+            pos = self.text_editor.index(tk.INSERT)
+            line, col = pos.split('.')
+            parts.append(f"Ln {line}, Col {int(col) + 1}")
+        except Exception:
+            pass
         self.status_bar.config(text="  ·  ".join(parts) if parts else "Ready")
+
+    def _created_tooltip_text(self):
+        created = self.notes.get(self.current_note_id, {}).get('created', '')
+        if not created:
+            return ''
+        try:
+            dt = datetime.fromisoformat(created)
+            return f"Created {dt.strftime('%Y/%m/%d, %H:%M')}"
+        except Exception:
+            return ''
 
     def _time_ago(self, iso_string):
         try:
@@ -817,14 +1042,22 @@ class NoteApp:
             elif seconds < 86400:
                 h = seconds // 3600
                 return f"{h} hour{'s' if h != 1 else ''} ago"
-            else:
+            elif seconds < 7 * 86400:
                 d = seconds // 86400
                 return f"{d} day{'s' if d != 1 else ''} ago"
+            elif dt.year == datetime.now().year:
+                return dt.strftime("%b %#d")
+            else:
+                return dt.strftime("%Y/%m/%d")
         except Exception:
             return ""
 
     def save_current_note(self):
         if not self.current_note_id:
+            return
+
+        # Skip if nothing has changed — avoids bumping modified timestamp on navigation
+        if not self.text_editor.edit_modified():
             return
 
         content = self.text_editor.get('1.0', tk.END).strip()
@@ -854,7 +1087,9 @@ class NoteApp:
             'modified': datetime.now().isoformat()
         })
 
-        self.title_label.config(text=title)
+        self.title_entry.delete(0, tk.END)
+        self.title_entry.insert(0, title)
+        self.root.title(f"Notes \u2014 {title}")
         self.save_notes()
         self.update_note_list()
         self.text_editor.edit_modified(False)
@@ -889,6 +1124,27 @@ class NoteApp:
             self.notes[note_id]['title'] = new_title[:50]
             self.save_notes()
             self.update_note_list()
+
+    def _on_title_edit(self, event=None):
+        if not self.current_note_id or self.current_note_id not in self.notes:
+            return
+        new_title = self.title_entry.get().strip()[:50] or 'Untitled'
+        # Sync the first line of the editor content to match
+        content = self.text_editor.get('1.0', tk.END).rstrip('\n')
+        lines = content.split('\n')
+        lines[0] = new_title
+        self.text_editor.delete('1.0', tk.END)
+        self.text_editor.insert('1.0', '\n'.join(lines))
+        self._tag_urls()
+        self.notes[self.current_note_id].update({
+            'title': new_title,
+            'content': '\n'.join(lines),
+            'modified': datetime.now().isoformat(),
+        })
+        self.root.title(f"Notes \u2014 {new_title}")
+        self.save_notes()
+        self.update_note_list()
+        self.text_editor.edit_modified(False)
 
     def export_all_notes(self):
         if not self.notes:
@@ -986,6 +1242,9 @@ class NoteApp:
 
     def on_closing(self):
         self.config['geometry'] = self.root.geometry()
+        if self.current_note_id:
+            self._scroll_positions[self.current_note_id] = self.text_editor.yview()[0]
+        self.config['scroll_positions'] = self._scroll_positions
         self.save_config()
         self.save_current_note()
         self.root.destroy()
